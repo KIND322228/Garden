@@ -1,0 +1,486 @@
+<!doctype html>
+<!--
+  САД ВСТРЕЧИ — один файл. Данные общие для двоих в Supabase.
+  Настройка: 1) создай проект на supabase.com; 2) SQL Editor -> вставь SQL ниже -> Run;
+  3) впиши SUPABASE_URL и SUPABASE_ANON_KEY (Settings -> API) в строки "НАСТРОЙКА" ниже.
+
+/* Сад встречи: вставь в Supabase -> SQL Editor -> Run (один раз). */
+create extension if not exists pgcrypto;
+
+create table if not exists gardens (
+  id uuid primary key default gen_random_uuid(),
+  meeting_date date not null,
+  total_days int not null default 189,
+  show_day_count boolean not null default true,
+  first_things jsonb not null default '[]'::jsonb,
+  photo text,
+  members jsonb not null default '[]'::jsonb,
+  waters jsonb not null default '{}'::jsonb,
+  notes jsonb not null default '{}'::jsonb,
+  created_at timestamptz default now()
+);
+
+/* Таблица закрыта: RLS без политик + никаких прав. Доступ только через функции ниже. */
+alter table gardens enable row level security;
+revoke all on gardens from anon, authenticated;
+
+create or replace function msk_today() returns date
+language sql stable as $$ select (now() at time zone 'Europe/Moscow')::date $$;
+
+create or replace function garden_public(g gardens) returns jsonb
+language sql stable as $$
+  select (to_jsonb(g) - 'photo') || jsonb_build_object('has_photo', g.photo is not null)
+$$;
+
+create or replace function _is_member(g gardens, tg bigint) returns boolean
+language sql stable as $$
+  select exists (select 1 from jsonb_array_elements(g.members) e where (e->>'id')::bigint = tg)
+$$;
+
+create or replace function get_garden(p_g uuid) returns jsonb
+language sql stable security definer set search_path = public as $$
+  select garden_public(g) from gardens g where g.id = p_g
+$$;
+
+create or replace function get_photo(p_g uuid) returns text
+language sql stable security definer set search_path = public as $$
+  select photo from gardens where id = p_g
+$$;
+
+create or replace function create_garden(p_tg bigint, p_name text, p_meeting date) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare r gardens;
+begin
+  if p_meeting <= msk_today() then raise exception 'date must be in the future'; end if;
+  insert into gardens (meeting_date, members)
+  values (p_meeting, jsonb_build_array(jsonb_build_object('id', p_tg, 'name', left(coalesce(p_name,'Я'), 40))))
+  returning * into r;
+  return garden_public(r);
+end $$;
+
+create or replace function join_garden(p_g uuid, p_tg bigint, p_name text) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare r gardens; nm text := left(coalesce(nullif(btrim(p_name), ''), 'Партнёр'), 40);
+begin
+  select * into r from gardens where id = p_g for update;
+  if not found then raise exception 'garden not found'; end if;
+  if _is_member(r, p_tg) then
+    update gardens set members = (
+      select jsonb_agg(case when (t.e->>'id')::bigint = p_tg then jsonb_set(t.e, '{name}', to_jsonb(nm)) else t.e end order by t.ord)
+      from jsonb_array_elements(r.members) with ordinality as t(e, ord)
+    ) where id = p_g returning * into r;
+  elsif jsonb_array_length(r.members) >= 2 then
+    raise exception 'garden is full';
+  else
+    update gardens set members = members || jsonb_build_array(jsonb_build_object('id', p_tg, 'name', nm))
+    where id = p_g returning * into r;
+  end if;
+  return garden_public(r);
+end $$;
+
+create or replace function water(p_g uuid, p_tg bigint) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare r gardens; d text := msk_today()::text;
+begin
+  select * into r from gardens where id = p_g for update;
+  if not found or not _is_member(r, p_tg) then raise exception 'not a member'; end if;
+  update gardens set waters = jsonb_set(waters, array[d],
+      coalesce(waters->d, '{}'::jsonb) || jsonb_build_object(p_tg::text, true), true)
+  where id = p_g returning * into r;
+  return garden_public(r);
+end $$;
+
+create or replace function save_note(p_g uuid, p_tg bigint, p_text text) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare r gardens; d text := msk_today()::text; t text := btrim(coalesce(p_text, ''));
+begin
+  if char_length(t) > 300 then raise exception 'note too long'; end if;
+  select * into r from gardens where id = p_g for update;
+  if not found or not _is_member(r, p_tg) then raise exception 'not a member'; end if;
+  if t = '' then
+    update gardens set notes = jsonb_set(notes, array[d], coalesce(notes->d, '{}'::jsonb) - p_tg::text, true)
+    where id = p_g returning * into r;
+  else
+    update gardens set notes = jsonb_set(notes, array[d],
+        coalesce(notes->d, '{}'::jsonb) || jsonb_build_object(p_tg::text, t), true)
+    where id = p_g returning * into r;
+  end if;
+  return garden_public(r);
+end $$;
+
+/* Настройки общие для обоих. Дату меняет только создатель (members[0]). */
+create or replace function update_garden(p_g uuid, p_tg bigint, p_patch jsonb) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare r gardens;
+begin
+  select * into r from gardens where id = p_g for update;
+  if not found or not _is_member(r, p_tg) then raise exception 'not a member'; end if;
+  if p_patch ? 'show_day_count' then r.show_day_count := (p_patch->>'show_day_count')::boolean; end if;
+  if p_patch ? 'first_things' then
+    if jsonb_typeof(p_patch->'first_things') <> 'array' or jsonb_array_length(p_patch->'first_things') > 10
+      then raise exception 'bad first_things'; end if;
+    r.first_things := p_patch->'first_things';
+  end if;
+  if p_patch ? 'meeting_date' then
+    if (r.members->0->>'id')::bigint <> p_tg then raise exception 'only creator can change the date'; end if;
+    if (p_patch->>'meeting_date')::date <= msk_today() then raise exception 'date must be in the future'; end if;
+    r.meeting_date := (p_patch->>'meeting_date')::date;
+  end if;
+  if p_patch ? 'photo' then
+    if char_length(coalesce(p_patch->>'photo', '')) > 450000 then raise exception 'photo too large'; end if;
+    r.photo := p_patch->>'photo';
+  end if;
+  update gardens set show_day_count = r.show_day_count, first_things = r.first_things,
+    meeting_date = r.meeting_date, photo = r.photo where id = p_g returning * into r;
+  return garden_public(r);
+end $$;
+
+grant execute on function get_garden(uuid), get_photo(uuid), create_garden(bigint, text, date),
+  join_garden(uuid, bigint, text), water(uuid, bigint), save_note(uuid, bigint, text),
+  update_garden(uuid, bigint, jsonb) to anon;
+
+-->
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Сад встречи</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600&family=Caveat&display=swap&subset=cyrillic" rel="stylesheet">
+<style>
+:root{--bg:#F7F1E5;--ink:#2E2A24;--green:#6B8E5A;--green-dk:#4F6B42;--ochre:#C9A66B;--accent:#D97A5C;--surface:rgba(255,255,255,.6);--surface2:rgba(255,255,255,.9);color-scheme:light}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#1E1B16;--ink:#F2EBDD;--green:#8FB27D;--green-dk:#6B8E5A;--accent:#E58C6F;--surface:rgba(255,255,255,.08);--surface2:rgba(255,255,255,.16);color-scheme:dark}}
+:root[data-theme=dark]{--bg:#1E1B16;--ink:#F2EBDD;--green:#8FB27D;--green-dk:#6B8E5A;--accent:#E58C6F;--surface:rgba(255,255,255,.08);--surface2:rgba(255,255,255,.16);color-scheme:dark}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%}
+body{background:var(--bg);color:var(--ink);font-family:Manrope,system-ui,sans-serif;transition:background .6s;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+button,input,textarea{font:inherit;color:inherit}
+main{min-height:100vh;display:flex;flex-direction:column;gap:16px;padding:24px;max-width:480px;margin:0 auto}
+.center{text-align:center}.dim{opacity:.6}.small{font-size:13px}.xl{font-size:22px;line-height:1.35}
+.btn{display:block;width:100%;border:0;border-radius:16px;background:var(--green);color:#fff;padding:14px;font-size:18px;cursor:pointer}
+.btn:active{background:var(--green-dk)}.btn:disabled{background:var(--ochre);opacity:.8;cursor:default}
+.btn.sm{width:auto;display:inline-block;padding:8px 16px;font-size:15px}
+.link{display:block;width:100%;border:0;border-radius:16px;background:var(--surface);padding:14px;text-align:center;cursor:pointer}
+.link:active{background:var(--surface2)}
+.ghost{border:0;background:none;padding:8px;opacity:.6;cursor:pointer;width:100%}
+.card{background:var(--surface);border-radius:16px;padding:14px;display:flex;flex-direction:column;gap:10px;text-align:left}
+.field{width:100%;border:0;border-radius:14px;background:var(--surface);padding:12px;font-size:16px}
+.field:disabled{opacity:.6}
+.note{font-family:Caveat,"Segoe Script","Bradley Hand",cursive;font-size:22px;white-space:pre-wrap}
+.row{display:flex;gap:12px;align-items:center;justify-content:space-between}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.chip{padding:6px 12px;border-radius:999px;background:var(--surface);font-size:14px}
+.chip.on{background:var(--green);color:#fff}
+.tog{width:44px;height:24px;border-radius:12px;background:rgba(201,166,107,.5);padding:2px;border:0;flex:none;cursor:pointer}
+.tog i{display:block;width:20px;height:20px;border-radius:50%;background:#fff;transition:transform .2s}
+.tog.on{background:var(--green)}.tog.on i{transform:translateX(20px)}
+.emoji{background:none;border:0;font-size:26px;cursor:pointer}
+.sp{flex:1}
+.plant{display:block;margin:0 auto;animation:breathe 5s ease-in-out infinite;transform-origin:50% 90%}
+.sway{animation:sway 6s ease-in-out infinite;transform-origin:100px 205px}
+.rays{animation:rays 4s ease-in-out infinite;transform-origin:100px 60px}
+@keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.03)}}
+@keyframes sway{0%,100%{transform:rotate(-1.2deg)}50%{transform:rotate(1.2deg)}}
+@keyframes rays{0%,100%{opacity:.45;transform:scale(.96)}50%{opacity:.9;transform:scale(1.04)}}
+@keyframes fall{0%{transform:translateY(-10vh) rotate(0);opacity:0}10%{opacity:.9}100%{transform:translateY(105vh) rotate(360deg);opacity:0}}
+.petal{position:fixed;top:0;width:12px;height:18px;border-radius:50% 50% 50% 0;background:var(--accent);opacity:0;pointer-events:none;animation:fall 9s linear infinite}
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:14px;opacity:0;transition:opacity .3s;pointer-events:none;font-size:14px;z-index:9;max-width:90%;text-align:center}
+#toast.show{opacity:1}
+img.photo{width:100%;max-height:320px;object-fit:cover;border-radius:24px}
+@media (prefers-reduced-motion:reduce){.plant,.sway,.rays,.petal{animation:none}}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="toast"></div>
+<script>
+"use strict";
+/* ===== НАСТРОЙКА ===== */
+const SUPABASE_URL = "https://jqskgeblriwzxmwkpsmg.supabase.co";   /* НАСТРОЙКА: Settings -> API -> Project URL */
+const SUPABASE_ANON_KEY = "sb_publishable_K0l6dz4B-V1Xo5iZagM-GQ_yFwahS-N";                  /* НАСТРОЙКА: Settings -> API -> anon public key */
+
+/* ===== Telegram ===== */
+const tg = window.Telegram && window.Telegram.WebApp;
+if (tg) { try { tg.ready(); tg.expand(); document.documentElement.dataset.theme = tg.colorScheme; } catch (e) {} }
+const tgUser = tg && tg.initDataUnsafe && tg.initDataUnsafe.user;
+const haptic = (t) => { try { tg && tg.HapticFeedback.impactOccurred(t || "light"); } catch (e) {} };
+
+/* ===== Даты и рост (по Москве) ===== */
+const NAMES = ["Семечко","Росток","Стебель","Бутон","Почти","Цветение"];
+const today = () => new Intl.DateTimeFormat("en-CA",{timeZone:"Europe/Moscow",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
+const utc = d => { const [y,m,x] = d.split("-").map(Number); return Date.UTC(y,m-1,x); };
+const between = (a,b) => Math.round((utc(b)-utc(a))/864e5);
+const addDays = (d,n) => new Date(utc(d)+n*864e5).toISOString().slice(0,10);
+const clamp = (n,a,b) => Math.min(b,Math.max(a,n));
+const elapsed = (m,t,d) => clamp(t-between(d,m),0,t);
+const dayNo = (m,t,d) => clamp(elapsed(m,t,d)+1,1,t);
+const stageOf = (m,t,d) => Math.min(6,Math.floor(elapsed(m,t,d)*6/t)+1);
+const daysLeft = (m,d) => Math.max(0,between(d,m));
+const plural = (n,f) => { const a=Math.abs(n)%100,b=a%10; return a>10&&a<20?f[2]:b===1?f[0]:b>=2&&b<=4?f[1]:f[2]; };
+const fmt = d => new Date(d+"T00:00:00").toLocaleDateString("ru-RU",{day:"numeric",month:"long"});
+const esc = s => String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const $ = id => document.getElementById(id);
+function toast(t){ const el=$("toast"); el.textContent=t; el.classList.add("show"); clearTimeout(toast.t); toast.t=setTimeout(()=>el.classList.remove("show"),2600); }
+
+/* ===== Локально на телефоне: id сада, имя, id для браузера без Telegram, ссылка на Mini App ===== */
+const KEY = "garden-meeting-v2";
+let L = {}; try { L = JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) {}
+const saveL = () => { try { localStorage.setItem(KEY, JSON.stringify(L)); } catch (e) {} };
+if (!L.uid) { L.uid = 10000000000 + Math.floor(Math.random()*1e9); saveL(); }
+const me = { id: tgUser ? tgUser.id : L.uid, name: (tgUser && tgUser.first_name) || L.name || "" };
+
+/* ===== Supabase ===== */
+const configured = !/YOUR-/.test(SUPABASE_URL + SUPABASE_ANON_KEY);
+const sb = configured && window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+async function rpc(fn, args) { const { data, error } = await sb.rpc(fn, args); if (error) throw error; return data; }
+const errText = e => /full/.test(e.message||"") ? "Сад уже заполнен: в нём двое." : /not found/.test(e.message||"") ? "Такого сада нет." : /creator/.test(e.message||"") ? "Дату меняет только создатель сада." : "Нет связи с садом. Попробуй ещё раз.";
+
+let G = null, view = "loading", ch = null, poll = null, photoCache = null, lastLocal = 0;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function linkGarden() {
+  const qp = new URLSearchParams(location.search);
+  const sp = (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) || qp.get("tgWebAppStartParam") || "";
+  const c = qp.get("g") || (sp.startsWith("g_") ? sp.slice(2) : "");
+  return UUID.test(c) ? c : "";
+}
+
+/* ===== Realtime (broadcast по id сада) + запасной опрос ===== */
+function startRealtime() {
+  stopRealtime();
+  try { ch = sb.channel("garden:" + G.id).on("broadcast", { event: "changed" }, () => refresh()).subscribe(); } catch (e) {}
+  poll = setInterval(refresh, window.__POLL_MS || 30000);
+}
+function stopRealtime() { try { ch && sb.removeChannel(ch); } catch (e) {} ch = null; clearInterval(poll); poll = null; }
+const ping = () => { try { ch && ch.send({ type: "broadcast", event: "changed", payload: {} }); } catch (e) {} };
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && G) refresh(); });
+
+/* ===== Помощники по данным ===== */
+const wat = d => (G.waters && G.waters[d]) || {};
+const partner = () => G.members.find(m => m.id !== me.id) || null;
+const pName = () => (partner() ? partner().name : "Партнёр");
+const isCreator = () => G.members[0] && G.members[0].id === me.id;
+const notesOf = d => (G.notes && G.notes[d]) || {};
+const who = id => id === me.id ? "Ты" : pName();
+
+async function refresh() {
+  if (!G || !sb) return;
+  try {
+    const n = await rpc("get_garden", { p_g: G.id }); if (!n) return;
+    const prev = G; if (JSON.stringify(prev) === JSON.stringify(n)) return; G = n; diffToasts(prev, n); softRender();
+  } catch (e) {}
+}
+function diffToasts(a, b) {
+  const p = partner(); if (!p) return; const t = today();
+  if (Date.now() - lastLocal < 4000) return;
+  if (a.show_day_count && !b.show_day_count) toast(p.name + " скрыл(а) количество дней. Сад продолжает расти.");
+  else if (view === "garden" && !(a.waters[t]||{})[p.id] && (b.waters[t]||{})[p.id]) toast(p.name + " полил(а) сад 🌱");
+  else if ((notesOf2(a,t)[p.id]||"") !== (notesOf2(b,t)[p.id]||"") && (notesOf2(b,t)[p.id]||"")) toast("Новая записка в саду 💌");
+}
+const notesOf2 = (g, d) => (g.notes && g.notes[d]) || {};
+function softRender() {
+  const a = document.activeElement, typing = a && /INPUT|TEXTAREA/.test(a.tagName);
+  if (view === "note") { const el = $("pnote"); if (el) el.innerHTML = partnerNote(); return; }
+  if (typing) return;
+  render();
+}
+
+/* ===== Растение (SVG) ===== */
+const LEAF="M0 0 C 8 -13 28 -13 38 0 C 28 11 8 11 0 0 Z", PETAL="M0 0 C -10 -9 -9 -30 0 -40 C 9 -30 10 -9 0 0 Z", BUD="M0 0 C -13 -8 -12 -28 0 -40 C 12 -28 13 -8 0 0 Z";
+function plant(stage, bonus, size) {
+  const h=[0,45,85,110,120,126][stage-1], top=205-h, pairs=stage<=1?0:stage===2?1:stage===3?2:3;
+  const leaf=(x,y,flip,s)=>`<path d="${LEAF}" fill="var(--green)" transform="translate(${x} ${y}) rotate(${flip?28:-28}) scale(${flip?-s:s} ${s})"/>`;
+  const sep=`<path d="M0 0 C -9 -2 -14 2 -16 8 C -8 8 -2 6 0 0 Z" fill="var(--green)"/><path d="M0 0 C 9 -2 14 2 16 8 C 8 8 2 6 0 0 Z" fill="var(--green)"/>`;
+  let g="";
+  if (stage>=2) {
+    g+=`<path d="M100 206 C 95 ${205-h*.33} 105 ${205-h*.66} 100 ${top}" stroke="var(--green-dk)" stroke-width="${stage===2?4:5}" fill="none" stroke-linecap="round"/>`;
+    for (let i=0;i<pairs;i++){ const y=196-((i+1)*h)/(pairs+1.4), s=stage===2?.7:.8+i*.1; g+=leaf(100,y,false,s)+leaf(100,y-12,true,s); }
+    if (stage===4) g+=`<g transform="translate(100 ${top+2})"><path d="${BUD}" fill="var(--accent)"/>${sep}</g>`;
+    if (stage===5) g+=`<g transform="translate(100 ${top+2})">${[-48,-24,0,24,48].map(a=>`<path d="${PETAL}" fill="var(--accent)" opacity="${a===0?1:.88}" transform="rotate(${a}) scale(.82)"/>`).join("")}${sep}</g>`;
+    if (stage===6) { let f=""; for(let i=0;i<10;i++) f+=`<path d="${PETAL}" fill="var(--accent)" transform="rotate(${i*36}) translate(0 -6) scale(1.05)"/>`;
+      for(let i=0;i<8;i++) f+=`<path d="${PETAL}" fill="var(--accent)" opacity=".7" transform="rotate(${i*45+22}) translate(0 -4) scale(.62)"/>`;
+      f+=`<circle r="11" fill="var(--ochre)"/>`; for(let i=0;i<6;i++) f+=`<circle r="1.6" fill="var(--green-dk)" cx="${5*Math.cos(i*1.047)}" cy="${5*Math.sin(i*1.047)}"/>`;
+      g+=`<g transform="translate(100 ${top-14})">${f}</g>`; }
+    g=`<g class="sway">${g}</g>`;
+  } else g+=`<ellipse cx="100" cy="203" rx="11" ry="7" fill="var(--ochre)"/>`;
+  const rays=bonus?`<g class="rays" stroke="var(--ochre)" stroke-width="3" stroke-linecap="round">${Array.from({length:12},(_,i)=>`<line x1="100" y1="22" x2="100" y2="8" transform="rotate(${i*30} 100 60)"/>`).join("")}</g>`:"";
+  const grass=stage>=2?`<g stroke="var(--green-dk)" stroke-width="2" stroke-linecap="round" fill="none" opacity=".8"><path d="M52 212 q-2 -9 3 -13"/><path d="M58 214 q1 -8 6 -11"/><path d="M146 212 q3 -8 -1 -13"/><path d="M140 214 q-1 -8 -6 -10"/></g>`:"";
+  return `<svg class="plant" viewBox="0 0 200 240" width="${size}" height="${size*1.2}" role="img" aria-label="Растение, стадия ${stage} из 6">${rays}<ellipse cx="100" cy="214" rx="68" ry="15" fill="var(--ochre)" opacity=".55"/><ellipse cx="100" cy="210" rx="52" ry="10" fill="var(--green-dk)" opacity=".35"/>${grass}${g}</svg>`;
+}
+const petals = n => Array.from({length:n},(_,i)=>`<span class="petal" style="left:${(i*8.3+3)%100}%;animation-delay:${i*.8}s;animation-duration:${8+i%4}s"></span>`).join("");
+
+/* ===== Экраны ===== */
+const vMsg = (text, btns) => `<main class="center" style="justify-content:center"><p class="xl">${text}</p>${btns||""}</main>`;
+function dayLine() {
+  const d=dayNo(G.meeting_date,G.total_days,today()), w=Math.ceil(daysLeft(G.meeting_date,today())/7);
+  return G.show_day_count
+    ? `<div class="xl" style="font-weight:600">День ${d} из ${G.total_days}</div><div class="dim">${w} ${plural(w,["неделя","недели","недель"])} до объятий</div>`
+    : `<div class="xl" style="font-weight:600">Сад растёт.</div><div class="dim">День ${d}</div>`;
+}
+function vOnboarding() {
+  return `<main style="justify-content:center"><p class="center xl">Между нами километры. Но это мелочь — давай вырастим сад.</p>
+  <p class="center dim">189 дней · 27 недель · 6 стадий</p>
+  ${me.name?"":`<input id="myname" class="field" placeholder="Твоё имя" maxlength="40">`}
+  <label class="small dim">Дата встречи<input id="date" type="date" class="field" min="${addDays(today(),1)}"></label>
+  <button class="btn" data-act="plant">Посадить семечко</button></main>`;
+}
+function inviteLink() {
+  if (L.appLink) return L.appLink + (L.appLink.includes("?")?"&":"?") + "startapp=g_" + G.id;
+  return location.origin + location.pathname + "?g=" + G.id;
+}
+function vGarden() {
+  const t=today(), st=stageOf(G.meeting_date,G.total_days,t), hidden=!G.show_day_count, p=partner();
+  const mine=!!wat(t)[me.id], theirs=!!(p&&wat(t)[p.id]), both=mine&&theirs, el=elapsed(G.meeting_date,G.total_days,t);
+  let status;
+  if (hidden) status = both?"Полили вдвоём. Растёт быстрее.":mine?"Полив сегодня ✓.":theirs?`${esc(p.name)} уже полил(а). Твой ход 🌱`:"Сад ждёт полива.";
+  else status = both?"Полили вдвоём. Растёт быстрее.":mine?`${esc(pName())} ещё не полил(а). Ничего страшного.`:theirs?`${esc(p.name)} уже полил(а). Твой ход 🌱`:"Сад ждёт. Ничего страшного — я тоже жду.";
+  let extra = "";
+  if (mine && !hidden) extra = (el>0&&el%7===0) ? "Неделя позади. Ты держишься. Я горжусь." : `Это не ${G.total_days} дней. Это ${G.total_days} поливов.`;
+  if (mine && hidden) extra = "Ещё один день позади.";
+  const chips = p ? `<div class="row" style="justify-content:center"><span class="chip ${mine?"on":""}">Ты ${mine?"💧":"·"}</span><span class="chip ${theirs?"on":""}">${esc(p.name)} ${theirs?"💧":"·"}</span></div>`
+    : `<section class="card"><div>Партнёр ещё не в саду</div><p class="small dim" style="margin:0">Отправь ему ссылку, и вы увидите один сад на двоих.</p><button class="btn sm" data-act="copylink">Скопировать ссылку</button></section>`;
+  return `<main class="center">${both?petals(8):""}<div class="small dim">${hidden?"Я всё ещё иду к тебе.":"Мы не ждём. Мы выращиваем."}</div>${plant(st,both,220)}
+  <div class="small dim">${NAMES[st-1]}</div>${dayLine()}${chips}<p style="margin:0">${status}</p>${extra?`<p class="small dim" style="margin:0">${extra}</p>`:""}<div class="sp"></div>
+  <button class="btn" data-act="water" ${mine?"disabled":""}>${mine?"Полито ✓":"💧 Полить"}</button>
+  <div class="grid2"><button class="link" data-act="go:note">✍️ Записка</button><button class="link" data-act="go:history">Наш сад</button></div>
+  <button class="ghost small" data-act="go:settings">Настройки</button></main>`;
+}
+function partnerNote() {
+  const p = partner(), txt = p ? (notesOf(today())[p.id] || "") : "";
+  return txt ? `<div class="card"><div class="small dim">${esc(p.name)}</div><div class="note">${esc(txt)}</div></div>` : "";
+}
+function vNote() {
+  const txt = notesOf(today())[me.id] || "";
+  return `<main><h1 style="margin:0;font-size:22px">Записка дня</h1><div id="pnote">${partnerNote()}</div>
+  <textarea id="note" class="field note" rows="6" maxlength="300" placeholder="Пара слов для сада…">${esc(txt)}</textarea>
+  <div class="row"><div>${["❤️","🌱","🌸","☀️","🤗","✨"].map(e=>`<button class="emoji" data-act="emoji:${e}">${e}</button>`).join("")}</div><span id="cnt" class="small dim">${txt.length}/300</span></div>
+  <p class="small dim" style="margin:0">Одна записка в день, править можно только сегодня. Партнёр увидит её в саду.</p>
+  <button class="btn" data-act="savenote">Сохранить</button>
+  <button class="ghost" data-act="go:garden">Назад в сад</button></main>`;
+}
+function vHistory() {
+  const keys = new Set([...Object.keys(G.waters||{}).filter(d=>Object.keys(wat(d)).length), ...Object.keys(G.notes||{}).filter(d=>Object.keys(notesOf(d)).length)]);
+  const items = [...keys].sort().reverse().map(d => { const st=stageOf(G.meeting_date,G.total_days,d), ws=Object.keys(wat(d)).map(Number);
+    const ns = Object.entries(notesOf(d)).map(([id,t]) => `<div><div class="small dim">${esc(who(Number(id)))}</div><div class="note">${esc(t)}</div></div>`).join("");
+    return `<section class="card"><div class="row" style="justify-content:flex-start">${plant(st,false,44)}<div>
+    <div>${G.show_day_count?`День ${dayNo(G.meeting_date,G.total_days,d)} · `:""}${fmt(d)}</div>
+    <div class="small dim">${NAMES[st-1]}${ws.length?" · полили: "+ws.map(i=>esc(who(i))).join(", "):""}</div></div></div>${ns}</section>`; }).join("");
+  return `<main><h1 style="margin:0;font-size:22px">Наш сад</h1>${items||'<p class="dim">Пока пусто. Первый полив — и сад начнёт помнить.</p>'}
+  <button class="ghost" data-act="go:garden">Назад в сад</button></main>`;
+}
+function vSettings() {
+  const things = G.first_things || [];
+  return `<main><h1 style="margin:0;font-size:22px">Настройки</h1>
+  <p class="small dim" style="margin:0">Общие настройки видят и меняют оба.</p>
+  <section class="card"><div class="row"><span>Показывать количество дней</span><button class="tog ${G.show_day_count?"on":""}" data-act="togdays"><i></i></button></div></section>
+  <section class="card"><label>Дата встречи${isCreator()?"":'<span class="small dim" style="display:block">Меняет только создатель сада</span>'}
+  <input id="sdate" type="date" class="field" ${isCreator()?"":"disabled"} min="${addDays(today(),1)}" value="${G.meeting_date}"></label>
+  ${isCreator()?`<button class="btn sm" data-act="savedate">Сохранить дату</button>`:""}</section>
+  <section class="card"><div>Фото для финала</div><input type="file" id="photo" accept="image/*">
+  <p class="small dim" style="margin:0">${G.has_photo?"Фото загружено ✓ (видно обоим)":"Увидите только вы двое, в день встречи."}</p></section>
+  <section class="card"><div>Первые дела после встречи <span class="small dim">(${things.length}/10)</span></div>
+  ${things.map((t,i)=>`<div class="row"><span>${esc(t)}</span><button class="ghost" style="width:auto" data-act="delthing:${i}">✕</button></div>`).join("")}
+  ${things.length<10?`<div class="row"><input id="thing" class="field" maxlength="100" placeholder="Например: обнять"><button class="btn sm" data-act="addthing">+</button></div>`:""}</section>
+  <section class="card"><div>Ссылка для партнёра</div>
+  <input id="applink" class="field" placeholder="Ссылка на Mini App из BotFather (необязательно)" value="${esc(L.appLink||"")}">
+  <p class="small dim" style="margin:0;word-break:break-all">${esc(inviteLink())}</p>
+  <button class="btn sm" data-act="copylink">Скопировать</button></section>
+  <button class="ghost small" data-act="leave">Покинуть сад на этом телефоне</button>
+  <button class="ghost" data-act="go:garden">Назад в сад</button></main>`;
+}
+function vFinal() {
+  const w=Math.round(G.total_days/7), things=G.first_things||[];
+  return `<main class="center">${petals(12)}${plant(6,true,200)}
+  <p class="xl" style="font-weight:600;margin:0">${G.total_days} ${plural(G.total_days,["день","дня","дней"])}. ${w} ${plural(w,["неделя","недели","недель"])}. Один сад. Теперь можно обниматься.</p>
+  ${G.has_photo?`<img id="fphoto" class="photo" alt="" hidden>`:""}
+  ${things.length?`<section class="card"><div class="small dim">Первые дела</div><ol style="margin:0;padding-left:22px" class="note">${things.map(t=>`<li>${esc(t)}</li>`).join("")}</ol></section>`:""}
+  <button class="ghost" data-act="go:garden">В сад</button></main>`;
+}
+
+function render() {
+  const retry = `<button class="btn" data-act="retry">Повторить</button>`;
+  let html;
+  if (!configured || !sb) html = vMsg(configured ? "Не загрузилась библиотека Supabase. Проверь интернет." : "Впиши SUPABASE_URL и SUPABASE_ANON_KEY в начале скрипта (инструкция в комментарии вверху файла).", configured?retry:"");
+  else if (view === "loading") html = vMsg("…");
+  else if (view === "error") html = vMsg(render.err || "Нет связи с садом.", retry + `<button class="ghost" data-act="own">Посадить свой сад</button>`);
+  else if (view === "onboarding") html = vOnboarding();
+  else html = { garden: vGarden, note: vNote, history: vHistory, settings: vSettings, final: vFinal }[view]();
+  $("app").innerHTML = html;
+  if (tg) { try { ["garden","onboarding","loading","error","final"].includes(view) && view !== "final" ? tg.BackButton.hide() : tg.BackButton.show(); } catch (e) {} }
+  if (view === "final" && G && G.has_photo) loadPhoto();
+}
+const go = v => { view = v; render(); window.scrollTo(0, 0); };
+if (tg) { try { tg.BackButton.onClick(() => go(G ? "garden" : "onboarding")); } catch (e) {} }
+async function loadPhoto() {
+  try { if (!photoCache) photoCache = await rpc("get_photo", { p_g: G.id }); const i = $("fphoto"); if (i && photoCache) { i.src = photoCache; i.hidden = false; } } catch (e) {}
+}
+const firstView = () => today() >= G.meeting_date ? "final" : "garden";
+
+/* ===== Запуск ===== */
+async function boot() {
+  view = "loading"; render(); if (!sb) return;
+  const link = linkGarden();
+  try {
+    if (link) {                                  /* ссылка-приглашение: сразу заходим в сад */
+      G = await rpc("join_garden", { p_g: link, p_tg: me.id, p_name: me.name || "Партнёр" });
+      L.g = link; saveL();
+      if (new URLSearchParams(location.search).has("g")) history.replaceState(null, "", location.pathname);
+    } else if (L.g) {
+      G = await rpc("get_garden", { p_g: L.g });
+      if (!G) { L.g = null; saveL(); }
+    }
+  } catch (e) { render.err = errText(e); view = "error"; return render(); }
+  if (!G) return go("onboarding");
+  startRealtime(); go(firstView());
+}
+
+/* ===== Действия ===== */
+async function act(fn, ok) {
+  try { lastLocal = Date.now(); G = await fn(); ping(); if (ok) toast(ok); render(); }
+  catch (e) { toast(errText(e)); }
+}
+const call = (fn, extra) => () => rpc(fn, Object.assign({ p_g: G.id, p_tg: me.id }, extra));
+function resize(file, max, cb) {
+  const img = new Image(), url = URL.createObjectURL(file);
+  img.onload = () => { const k=Math.min(1,max/Math.max(img.width,img.height)), c=document.createElement("canvas");
+    c.width=Math.round(img.width*k); c.height=Math.round(img.height*k); c.getContext("2d").drawImage(img,0,0,c.width,c.height);
+    URL.revokeObjectURL(url); cb(c.toDataURL("image/jpeg", .7)); };
+  img.onerror = () => toast("Не удалось прочитать фото"); img.src = url;
+}
+
+document.addEventListener("click", async e => {
+  const b = e.target.closest("[data-act]"); if (!b) return;
+  const [a, arg] = b.dataset.act.split(/:(.*)/s);
+  haptic();
+  if (a === "go") return go(arg);
+  if (a === "retry") return boot();
+  if (a === "own") { L.g = null; saveL(); history.replaceState(null, "", location.pathname); G = null; return go("onboarding"); }
+  if (a === "plant") {
+    const d = $("date").value, name = (me.name || ($("myname") && $("myname").value.trim()) || "").trim();
+    if (!d || !name) return toast("Укажи имя и дату встречи");
+    try { G = await rpc("create_garden", { p_tg: me.id, p_name: name, p_meeting: d }); me.name = name; L.name = name; L.g = G.id; saveL(); startRealtime(); return go("garden"); }
+    catch (err) { return toast(errText(err)); }
+  }
+  if (a === "water") return act(call("water"));
+  if (a === "emoji") { const t = $("note"); t.value = (t.value + arg).slice(0, 300); $("cnt").textContent = t.value.length + "/300"; return; }
+  if (a === "savenote") return act(call("save_note", { p_text: $("note").value }), "Сохранено ✓");
+  if (a === "togdays") return act(call("update_garden", { p_patch: { show_day_count: !G.show_day_count } }));
+  if (a === "savedate") { const d = $("sdate").value; if (!d || d <= today()) return toast("Дата должна быть в будущем"); return act(call("update_garden", { p_patch: { meeting_date: d } }), "Сохранено ✓"); }
+  if (a === "addthing") { const v = $("thing").value.trim(); if (!v) return; return act(call("update_garden", { p_patch: { first_things: [...(G.first_things||[]), v] } })); }
+  if (a === "delthing") { const t = (G.first_things||[]).slice(); t.splice(+arg, 1); return act(call("update_garden", { p_patch: { first_things: t } })); }
+  if (a === "copylink") { const f = $("applink"); if (f) { L.appLink = f.value.trim(); saveL(); }
+    const l = inviteLink();
+    try { await navigator.clipboard.writeText(l); toast("Ссылка скопирована ✓"); } catch (_) { prompt("Скопируй ссылку", l); }
+    return view === "settings" ? render() : undefined; }
+  if (a === "leave") { if (!confirm("Покинуть сад на этом телефоне? Сад останется у партнёра, вернуться можно по ссылке.")) return;
+    stopRealtime(); L.g = null; saveL(); G = null; photoCache = null; return go("onboarding"); }
+});
+document.addEventListener("input", e => { if (e.target.id === "note") $("cnt").textContent = e.target.value.length + "/300"; });
+document.addEventListener("change", e => {
+  if (e.target.id === "photo" && e.target.files[0]) resize(e.target.files[0], 1000, d => { photoCache = d; act(call("update_garden", { p_patch: { photo: d } }), "Фото сохранено ✓"); });
+});
+boot();
+</script>
+</body>
+</html>
