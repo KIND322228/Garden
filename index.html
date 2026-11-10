@@ -200,10 +200,12 @@ img.photo{width:100%;max-height:320px;object-fit:cover;border-radius:24px}
 /* ===== НАСТРОЙКА ===== */
 const SUPABASE_URL = "https://jqskgeblriwzxmwkpsmg.supabase.co";   /* НАСТРОЙКА: Settings -> API -> Project URL */
 const SUPABASE_ANON_KEY = "sb_publishable_K0l6dz4B-V1Xo5iZagM-GQ_yFwahS-N";                  /* НАСТРОЙКА: Settings -> API -> anon public key */
+const TG_APP_LINK = "https://t.me/nash_sad_bot/sadd";   /* НАСТРОЙКА: ссылка на Mini App из BotFather, вида https://t.me/имя_бота/имя_приложения */
 
 /* ===== Telegram ===== */
 const tg = window.Telegram && window.Telegram.WebApp;
 if (tg) { try { tg.ready(); tg.expand(); document.documentElement.dataset.theme = tg.colorScheme; } catch (e) {} }
+const inTelegram = !!(tg && tg.initData);   /* вне Telegram (обычный браузер) сад не открывается */
 const tgUser = tg && tg.initDataUnsafe && tg.initDataUnsafe.user;
 const haptic = (t) => { try { tg && tg.HapticFeedback.impactOccurred(t || "light"); } catch (e) {} };
 
@@ -325,9 +327,9 @@ function vOnboarding() {
   <label class="small dim">Дата встречи<input id="date" type="date" class="field" min="${addDays(today(),1)}"></label>
   <button class="btn" data-act="plant">Посадить семечко</button></main>`;
 }
-function inviteLink() {
-  if (L.appLink) return L.appLink + (L.appLink.includes("?")?"&":"?") + "startapp=g_" + G.id;
-  return location.origin + location.pathname + "?g=" + G.id;
+function inviteLink() {            /* только t.me-ссылка: она открывает сад внутри Telegram */
+  const base = TG_APP_LINK || L.appLink || "";
+  return base ? base + (base.includes("?")?"&":"?") + "startapp=g_" + G.id : "";
 }
 function vGarden() {
   const t=today(), st=stageOf(G.meeting_date,G.total_days,t), hidden=!G.show_day_count, p=partner();
@@ -383,8 +385,8 @@ function vSettings() {
   ${things.map((t,i)=>`<div class="row"><span>${esc(t)}</span><button class="ghost" style="width:auto" data-act="delthing:${i}">✕</button></div>`).join("")}
   ${things.length<10?`<div class="row"><input id="thing" class="field" maxlength="100" placeholder="Например: обнять"><button class="btn sm" data-act="addthing">+</button></div>`:""}</section>
   <section class="card"><div>Ссылка для партнёра</div>
-  <input id="applink" class="field" placeholder="Ссылка на Mini App из BotFather (необязательно)" value="${esc(L.appLink||"")}">
-  <p class="small dim" style="margin:0;word-break:break-all">${esc(inviteLink())}</p>
+  ${TG_APP_LINK?"":`<input id="applink" class="field" placeholder="Ссылка на Mini App: https://t.me/бот/приложение" value="${esc(L.appLink||"")}">`}
+  <p class="small dim" style="margin:0;word-break:break-all">${esc(inviteLink()||"Вставь ссылку на Mini App из BotFather — по ней партнёр откроет сад в Telegram.")}</p>
   <button class="btn sm" data-act="copylink">Скопировать</button></section>
   <button class="ghost small" data-act="leave">Покинуть сад на этом телефоне</button>
   <button class="ghost" data-act="go:garden">Назад в сад</button></main>`;
@@ -401,7 +403,8 @@ function vFinal() {
 function render() {
   const retry = `<button class="btn" data-act="retry">Повторить</button>`;
   let html;
-  if (!configured || !sb) html = vMsg(configured ? "Не загрузилась библиотека Supabase. Проверь интернет." : "Впиши SUPABASE_URL и SUPABASE_ANON_KEY в начале скрипта (инструкция в комментарии вверху файла).", configured?retry:"");
+  if (!inTelegram) html = vMsg("Сад открывается только в Telegram 🌱", TG_APP_LINK ? `<a class="btn" style="text-decoration:none" href="${esc(TG_APP_LINK)}">Открыть в Telegram</a>` : `<p class="small dim">Открой ссылку на Mini App из Telegram.</p>`);
+  else if (!configured || !sb) html = vMsg(configured ? "Не загрузилась библиотека Supabase. Проверь интернет." : "Впиши SUPABASE_URL и SUPABASE_ANON_KEY в начале скрипта (инструкция в комментарии вверху файла).", configured?retry:"");
   else if (view === "loading") html = vMsg("…");
   else if (view === "error") html = vMsg(render.err || "Нет связи с садом.", retry + `<button class="ghost" data-act="own">Посадить свой сад</button>`);
   else if (view === "onboarding") html = vOnboarding();
@@ -419,6 +422,7 @@ const firstView = () => today() >= G.meeting_date ? "final" : "garden";
 
 /* ===== Запуск ===== */
 async function boot() {
+  if (!inTelegram) { view = "blocked"; return render(); }
   view = "loading"; render(); if (!sb) return;
   const link = linkGarden();
   try {
@@ -471,6 +475,7 @@ document.addEventListener("click", async e => {
   if (a === "delthing") { const t = (G.first_things||[]).slice(); t.splice(+arg, 1); return act(call("update_garden", { p_patch: { first_things: t } })); }
   if (a === "copylink") { const f = $("applink"); if (f) { L.appLink = f.value.trim(); saveL(); }
     const l = inviteLink();
+    if (!l) { toast("Сначала вставь ссылку на Mini App из BotFather"); return view === "settings" ? undefined : go("settings"); }
     try { await navigator.clipboard.writeText(l); toast("Ссылка скопирована ✓"); } catch (_) { prompt("Скопируй ссылку", l); }
     return view === "settings" ? render() : undefined; }
   if (a === "leave") { if (!confirm("Покинуть сад на этом телефоне? Сад останется у партнёра, вернуться можно по ссылке.")) return;
